@@ -387,7 +387,7 @@ nav{position:fixed;top:0;left:0;right:0;z-index:500;height:var(--nav);background
     </div>
     <div class="search-wrap">
       <span class="si">🔍</span>
-      <input type="search" id="sheetSearch" placeholder="Cerca nome, città..." oninput="onSearch(this)">
+      <input type="search" id="sheetSearch" placeholder="Cerca nome, città..." oninput="debounceSearch(this)">
       <button class="clr-btn" id="clrBtn" onclick="clearSearch()">✕</button>
     </div>
     <div class="stabs">
@@ -881,11 +881,17 @@ function makeIcon(p, sel) {
   });
 }
 
+let _lastRenderKey = '';
 function renderMap() {
   if (!mapReady) return;
+  const places = activePlaces();
+  // Full rebuild only when places list or selection changes
+  const renderKey = places.map(p => p.id + p.status + p.stars).join(',') + '|' + (selId || '');
+  if (renderKey === _lastRenderKey) return;
+  _lastRenderKey = renderKey;
   Object.values(mapMarkers).forEach(m => map.removeLayer(m));
   mapMarkers = {};
-  activePlaces().forEach(p => {
+  places.forEach(p => {
     if (!p.lat || !p.lng) return;
     const sel = selId === p.id;
     const mine = isMyMap();
@@ -908,6 +914,8 @@ function renderMap() {
     m.addTo(map);
     mapMarkers[p.id] = m;
   });
+  // Update zoom control position to avoid sheet overlap
+  if (map.zoomControl) map.zoomControl.setPosition('bottomright');
 }
 
 // ─── VIEW OTHER USER ─────────────────────────────────────
@@ -976,6 +984,12 @@ function setSnap(s, anim = true) {
   if (!anim) requestAnimationFrame(() => sheet.style.transition = '');
 }
 
+let _searchTimer = null;
+function debounceSearch(inp) {
+  $('clrBtn').style.display = inp.value ? 'block' : 'none';
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => renderSheet(), 150);
+}
 function onSearch(inp) {
   $('clrBtn').style.display = inp.value ? 'block' : 'none';
   renderSheet();
@@ -1145,12 +1159,18 @@ function renderDrawer(p) {
       : '') +
     '<div style="font-size:11px;color:var(--t3);margin-top:14px">Aggiunto il ' + fmtD(p.created) + '</div>';
 
-  // Build Maps URL — prefer saved link, then coordinates, then name search
+  // Build best Maps URL:
+  // 1. Saved original Google Maps link (opens exact place)
+  // 2. Coordinates with place name (very precise)
+  // 3. Name + city search (fallback)
   let mapsUrl;
-  if (p.gmUrl && (p.gmUrl.includes('google.com/maps') || p.gmUrl.includes('goo.gl') || p.gmUrl.includes('maps.app'))) {
+  if (p.gmUrl && p.gmUrl.includes('google.com/maps')) {
     mapsUrl = p.gmUrl;
+  } else if (p.gmUrl && (p.gmUrl.includes('goo.gl') || p.gmUrl.includes('maps.app'))) {
+    mapsUrl = p.gmUrl; // Short link — still works to open Maps
   } else if (p.lat && p.lng) {
-    mapsUrl = 'https://www.google.com/maps/place/' + encodeURIComponent(p.name) + '/@' + p.lat + ',' + p.lng + ',17z';
+    // Build a proper place link with name + coordinates
+    mapsUrl = 'https://www.google.com/maps/search/' + encodeURIComponent(p.name) + '/@' + p.lat + ',' + p.lng + ',17z';
   } else {
     mapsUrl = 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent([p.name, p.address, p.city].filter(Boolean).join(', '));
   }
@@ -1427,94 +1447,182 @@ function togDone() {
   $('doneF').style.display = $('fStat').value === 'done' ? 'grid' : 'none';
 }
 
+
+// Helper: Nominatim fetch with 5s timeout
+async function nominatimFetch(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await fetch(url, {
+      headers: { 'Accept-Language': 'it', 'User-Agent': 'ItalySpots/1.0' },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    return await r.json();
+  } catch(e) { clearTimeout(timer); return null; }
+}
+
+// Helper: extract coordinates from any Google Maps URL format
+function extractCoordsFromUrl(url) {
+  // Pattern !3d lat !4d lng (desktop links)
+  const p4 = url.match(/!3d(-?[0-9]+\.[0-9]+).*?!4d(-?[0-9]+\.[0-9]+)/);
+  if (p4) return { lat: parseFloat(p4[1]), lng: parseFloat(p4[2]) };
+  // Pattern @lat,lng
+  const p1 = url.match(/@(-?[0-9]+\.[0-9]+),(-?[0-9]+\.[0-9]+)/);
+  if (p1) return { lat: parseFloat(p1[1]), lng: parseFloat(p1[2]) };
+  // Pattern ?q=lat,lng or ll=lat,lng
+  const p2 = url.match(/[?&](?:q|ll|center)=(-?[0-9]+\.[0-9]+),(-?[0-9]+\.[0-9]+)/);
+  if (p2) return { lat: parseFloat(p2[1]), lng: parseFloat(p2[2]) };
+  // Pattern maps/@lat,lng
+  const p3 = url.match(/maps\/@?(-?[0-9]+\.[0-9]+),(-?[0-9]+\.[0-9]+)/);
+  if (p3) return { lat: parseFloat(p3[1]), lng: parseFloat(p3[2]) };
+  return null;
+}
+
+// Helper: extract place name from Google Maps URL
+function extractPlaceNameFromUrl(url) {
+  const m = url.match(/\/place\/([^\/\/@?&\n+,]+)/);
+  return m ? decodeURIComponent(m[1].replace(/\+/g,' ').replace(/_/g,' ')).trim() : '';
+}
+
+// Helper: parse Nominatim address fields
+function parseNominatimAddr(d) {
+  const a = d.address || {};
+  return {
+    name: d.name || (d.display_name||'').split(',')[0] || '',
+    city: a.city || a.town || a.village || a.municipality || a.suburb || a.county || '',
+    region: a.state || '',
+    address: (a.road || '') + (a.house_number ? ' ' + a.house_number : '')
+  };
+}
+
 // ─── GEOCODE ─────────────────────────────────────────────
 async function doGeo() {
-  const raw = $('gmIn').value.trim();
-  if (!raw) { $('urlMsg').innerHTML = '<div class="msg-err">Incolla un link Google Maps o scrivi il nome del posto.</div>'; return; }
+  const rawInput = $('gmIn').value.trim();
+  if (!rawInput) { $('urlMsg').innerHTML = '<div class="msg-err">Incolla un link Google Maps o scrivi il nome del posto.</div>'; return; }
 
   const btn = $('geoBtn'); const txt = $('geoTxt');
   txt.textContent = '⏳ Ricerca...'; btn.disabled = true;
   $('urlMsg').innerHTML = ''; $('urlRes').innerHTML = '';
 
+  let raw = rawInput;
   let lat = null, lng = null, name = '', city = '', region = '', address = '';
   const isHttp = raw.startsWith('http');
   const isShort = raw.includes('goo.gl') || raw.includes('maps.app');
 
-  // Extract coords — all known Google Maps URL formats
-  const patterns = [
-    /@(-?[0-9]+\.?[0-9]*),(-?[0-9]+\.?[0-9]*)/,           // @lat,lng
-    /[?&](?:q|ll|center)=(-?[0-9]+\.?[0-9]*),(-?[0-9]+\.?[0-9]*)/, // ?q= ?ll=
-    /maps\/@?(-?[0-9]+\.?[0-9]*),(-?[0-9]+\.?[0-9]*)/,     // maps/@lat,lng
-    /!3d(-?[0-9]+\.?[0-9]*).*?!4d(-?[0-9]+\.?[0-9]*)/,     // !3d...!4d (desktop links)
-  ];
-  for (const re of patterns) {
-    const m = raw.match(re);
-    if (m) { lat = parseFloat(m[1]); lng = parseFloat(m[2]); break; }
+  // Step 1: resolve short link to get full URL with coordinates
+  if (isShort) {
+    txt.textContent = '⏳ Risolvo link...';
+    try {
+      // Use allorigins to follow redirect and get final URL
+      const proxyUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(raw);
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 6000);
+      const r = await fetch(proxyUrl, { signal: controller.signal });
+      const d = await r.json();
+      // The final URL is in the contents or we can parse the response URL
+      if (d && d.status && d.status.url) {
+        raw = d.status.url; // This is the resolved URL
+      } else if (d && d.contents) {
+        // Try to extract redirect URL from HTML content
+        const urlMatch = d.contents.match(/https:\/\/www\.google\.com\/maps[^"'\s]+/);
+        if (urlMatch) raw = urlMatch[0];
+      }
+    } catch(e) {
+      // Proxy failed — try alternative
+      try {
+        const r2 = await nominatimFetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(raw));
+        // If we got HTML back, extract maps URL
+        if (typeof r2 === 'string') {
+          const m = r2.match(/https:\/\/www\.google\.com\/maps[^"'\s<>]+/);
+          if (m) raw = m[0];
+        }
+      } catch(e2) {}
+    }
+    txt.textContent = '⏳ Ricerca...';
   }
 
-  // Extract place name from URL
-  let placeName = '';
-  const pm = raw.match(/\/place\/([^\/\/@?&\n+,]+)/);
-  if (pm) placeName = decodeURIComponent(pm[1].replace(/\+/g, ' ').replace(/_/g, ' ')).trim();
+  // Step 2: extract coords from (possibly resolved) URL
+  if (raw.startsWith('http')) {
+    const coords = extractCoordsFromUrl(raw);
+    if (coords) { lat = coords.lat; lng = coords.lng; }
+  }
 
-  // Reverse geocode if we have coords
+  // Step 3: extract place name from URL
+  const placeName = raw.startsWith('http') ? extractPlaceNameFromUrl(raw) : '';
+
+  // Step 4: reverse geocode if we have coords
   if (lat && lng) {
-    try {
-      const r = await fetch('https://nominatim.openstreetmap.org/reverse?lat=' + lat + '&lon=' + lng + '&format=json&addressdetails=1&zoom=16',
-        { headers: { 'Accept-Language': 'it', 'User-Agent': 'ItalySpots/1.0' } });
-      const d = await r.json();
-      if (d && !d.error) {
-        const a = d.address || {};
-        name = placeName || d.name || d.display_name?.split(',')[0] || '';
-        city = a.city || a.town || a.village || a.municipality || a.suburb || '';
-        region = a.state || '';
-        address = (a.road || '') + (a.house_number ? ' ' + a.house_number : '');
-      }
-    } catch(e) {}
+    const d = await nominatimFetch(
+      'https://nominatim.openstreetmap.org/reverse?lat=' + lat + '&lon=' + lng +
+      '&format=json&addressdetails=1&zoom=16'
+    );
+    if (d && !d.error) {
+      const p = parseNominatimAddr(d);
+      // Prefer the name from Google Maps URL over Nominatim generic name
+      name = placeName || p.name;
+      city = p.city; region = p.region; address = p.address;
+    }
+    if (!name) name = placeName;
   }
 
-  // Forward geocode if no coords yet
-  const searchText = isHttp ? placeName : raw;
+  // Step 5: forward geocode by name if still no coords
+  const searchText = raw.startsWith('http') ? placeName : rawInput;
   if (!lat && searchText) {
-    try {
-      const r = await fetch('https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(searchText + ', Italia') + '&format=json&limit=1&addressdetails=1&countrycodes=it',
-        { headers: { 'Accept-Language': 'it', 'User-Agent': 'ItalySpots/1.0' } });
-      const d = await r.json();
-      if (d && d[0]) {
-        lat = parseFloat(d[0].lat); lng = parseFloat(d[0].lon);
-        const a = d[0].address || {};
-        name = d[0].name || searchText;
-        city = a.city || a.town || a.village || a.municipality || '';
-        region = a.state || '';
-        address = (a.road || '') + (a.house_number ? ' ' + a.house_number : '');
-      }
-    } catch(e) {}
+    // Try exact name first, then with "Italia" appended
+    let d = await nominatimFetch(
+      'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(searchText) +
+      '&format=json&limit=1&addressdetails=1&countrycodes=it'
+    );
+    if (!d || !d[0]) {
+      d = await nominatimFetch(
+        'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(searchText + ' Italia') +
+        '&format=json&limit=1&addressdetails=1&countrycodes=it'
+      );
+    }
+    if (d && d[0]) {
+      lat = parseFloat(d[0].lat); lng = parseFloat(d[0].lon);
+      const p = parseNominatimAddr(d[0]);
+      name = p.name || searchText; city = p.city; region = p.region; address = p.address;
+    }
   }
 
   btn.disabled = false; txt.textContent = '🔍 Trova luogo';
 
   if (!lat || !lng) {
     let msg = '<div class="msg-err">Posto non trovato.';
-    if (isShort) msg += '<br><br>⚠️ <strong>Link breve non supportato.</strong><br>Apri il link → copia l\'URL dalla barra del browser (quello lungo con google.com/maps/...).';
-    msg += '<br><br>💡 Scrivi direttamente il nome: es. <em>Trattoria Mario Roma</em></div>';
+    if (isShort && raw === rawInput) {
+      // Short link couldn't be resolved
+      msg += '<br><br>⚠️ <strong>Link breve non risolto.</strong><br>' +
+        '1. Apri il link nel browser<br>' +
+        '2. Copia l'URL dalla barra degli indirizzi (quello lungo con google.com/maps/...)<br>' +
+        '3. Incollalo qui';
+    }
+    msg += '<br><br>💡 Oppure usa <strong>Manuale ✏️</strong> e scrivi nome + città, es: <em>Pizzeria Brandi Napoli</em></div>';
     $('urlMsg').innerHTML = msg;
     return;
   }
 
-  // Validate Italy bounds (approx)
+  // Validate Italy bounds
   if (lat < 35 || lat > 48 || lng < 5 || lng > 20) {
-    $('urlMsg').innerHTML = '<div class="msg-err">Le coordinate sembrano fuori dall\'Italia. Prova a cercare per nome.</div>';
+    $('urlMsg').innerHTML = '<div class="msg-err">Coordinate fuori dall'Italia. Usa il tab Manuale e scrivi il nome del posto.</div>';
     btn.disabled = false; return;
   }
 
-  geocoded = { lat, lng };
+  // Save the best available URL for "Apri in Google Maps"
+  // Prefer the original long URL, fall back to resolved URL
+  const bestUrl = rawInput.includes('google.com/maps') ? rawInput :
+                  raw.includes('google.com/maps') ? raw : rawInput;
+
+  geocoded = { lat, lng, gmUrl: bestUrl };
   if (name) $('fName').value = name;
   if (city) $('fCity').value = city;
   if (region) $('fRegion').value = region;
   if (address) $('fAddr').value = address;
   $('coordHint').innerHTML = '📍 ' + lat.toFixed(5) + ', ' + lng.toFixed(5);
   $('urlRes').innerHTML =
-    '<div class="msg-ok" style="margin-top:10px">✅ <strong>' + (name || 'Luogo trovato') + '</strong>' + (city ? ', ' + city : '') + '</div>' +
+    '<div class="msg-ok" style="margin-top:10px">✅ <strong>' + (name || 'Luogo trovato') + '</strong>' +
+    (city ? ', ' + city : '') + '</div>' +
     '<button class="pbtn" style="margin-top:6px" onclick="confirmGeo()">Continua → Completa i dettagli</button>';
 }
 
@@ -1546,7 +1654,7 @@ async function savePlace() {
     status,
     stars: parseInt($('fStars').value) || 0,
     note: $('fNote').value.trim(),
-    gmUrl: ($('gmIn')?.value || '').trim(),
+    gmUrl: geocoded?.gmUrl || ($('gmIn')?.value || '').trim(),
     lat: geocoded?.lat || null,
     lng: geocoded?.lng || null,
     visited: status === 'done' ? ($('fVisit').value || today()) : null,
@@ -1629,3 +1737,4 @@ window.addEventListener('load', async () => {
 </script>
 </body>
 </html>
+
