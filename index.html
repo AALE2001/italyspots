@@ -858,8 +858,9 @@ function updateAvatarBtn() {
 function initMap() {
   if (map) return;
   map = L.map('map', { center: [42.5, 12.5], zoom: 6, zoomControl: true });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-    attribution: '© OpenStreetMap © CARTO', subdomains: 'abcd', maxZoom: 19
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    subdomains: 'abc', maxZoom: 19
   }).addTo(map);
   map.zoomControl.setPosition('bottomright');
   mapReady = true;
@@ -1605,7 +1606,7 @@ async function doGeo() {
 
   // Validate Italy bounds
   if (lat < 35 || lat > 48 || lng < 5 || lng > 20) {
-    $('urlMsg').innerHTML = '<div class="msg-err">Coordinate fuori dall\'Italia. Usa il tab Manuale e scrivi il nome del posto.</div>';
+    $('urlMsg').innerHTML = '<div class="msg-err">Coordinate fuori dall'Italia. Usa il tab Manuale e scrivi il nome del posto.</div>';
     btn.disabled = false; return;
   }
 
