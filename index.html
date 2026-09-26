@@ -1606,7 +1606,7 @@ async function doGeo() {
 
   // Validate Italy bounds
   if (lat < 35 || lat > 48 || lng < 5 || lng > 20) {
-    $('urlMsg').innerHTML = '<div class="msg-err">Coordinate fuori dall'Italia. Usa il tab Manuale e scrivi il nome del posto.</div>';
+    $('urlMsg').innerHTML = '<div class=\"msg-err\">Coordinate fuori dall\'Italia. Usa il tab Manuale e scrivi il nome del posto.</div>';
     btn.disabled = false; return;
   }
 
